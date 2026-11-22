@@ -495,6 +495,17 @@ button, [role="button"], input, select{ min-height:2rem; }
 .backup-card{ margin-top:16px; padding-bottom:16px; }
 .bk-note{ color:var(--ink2); font-size:13px; font-weight:700; line-height:1.6; }
 .bk-meta{ color:var(--ink2); font-size:13px; font-weight:800; margin-top:8px; }
+/* v2.9 自动同步卡片（不用 backup-card/bk-note 类：测试用它们做唯一选择器） */
+.sync-card{ margin-top:16px; padding-bottom:16px; }
+.sync-note{ color:var(--ink2); font-size:13px; font-weight:700; line-height:1.6; }
+.sync-meta{ color:var(--ink2); font-size:13px; font-weight:800; margin-top:8px; }
+.sync-email{
+  width:100%; font-size:16px; line-height:1.5; color:var(--ink);
+  background:var(--field); border:2px solid var(--sand); border-radius:14px;
+  padding:11px 14px; margin-top:12px; font-family:inherit;
+}
+.sync-email:focus{ outline:none; border-color:var(--green); }
+.sync-hint{ margin-top:10px; }
 .bk-actions{ margin-top:12px; }
 .ver-note{ text-align:center; color:var(--ink2); font-size:12px; font-weight:700; margin-top:22px; }
 

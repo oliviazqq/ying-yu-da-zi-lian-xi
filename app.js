@@ -108,6 +108,9 @@
   /* ---------- state: localStorage v3（场景键 = 场景 id，如 pc01 / vc01） ---------- */
   var KEY3 = "typing-trainer-offline-v3";
   var KEY2 = "typing-trainer-offline-v2";
+  /* v2.9 同步：启动加载期间（loadState 的迁移写回）不算本地修改，否则每次打开
+     都会把本地时间刷成最新、盖掉远端更新。loadState 之后置 false（见底部启动代码）。 */
+  var syncBooting = true;
   /* 种子：在线版账号现有进度的只读副本（2026-11-19 导出）。
      pc01 起床：单词下标 2,3,4,5,7 已掌握（alarm / awake / yawn / stretch / make the bed），
      累计学习时长 53 秒；无收藏。 */
@@ -218,6 +221,8 @@
   }
   function saveState(){
     try{ window.localStorage.setItem(KEY3, JSON.stringify(S)); }catch(e){}
+    /* v2.9：每次保存都记本地修改时间并安排同步推送（启动加载期间除外） */
+    if(!syncBooting){ markLocalModified(); scheduleSyncPush(); }
   }
   function scState(id){
     var k = String(id);
@@ -2319,6 +2324,7 @@
           if(ok){
             if(stillCurrent){ R.items = list; R.renderRow(); }
             toast("录音已保存");
+            syncOnRecordingChanged(); /* v2.9：录音是同步内容之一 */
           }else{
             /* 降级：下载为文件（已切到别的键时不弹下载，只提示失败，与 v2.1 一致） */
             if(!stillCurrent){ toast("录音保存失败"); return; }
@@ -2394,6 +2400,7 @@
       if(!R.items.length) IDB.del(key, function(){});
       else IDB.put(key, { list:R.items }, function(){});
       toast("录音已删除");
+      syncOnRecordingChanged(); /* v2.9：录音是同步内容之一（推送防抖 2 秒，写操作已完成） */
     };
     R.stopAll = function(){
       if(R.mr && R.mr.state!=="inactive"){ try{ R.mr.stop(); }catch(e){} }
@@ -2906,6 +2913,7 @@
   var RATE_OPTS = [0.7, 0.85, 1.0];
   function renderSettings(){
     refreshBackupCount();
+    renderSyncCard(); /* v2.9：同步卡片状态与登录态 */
     $("m-goal").innerHTML = GOAL_OPTS.map(function(g){
       return '<button data-goal="'+g+'" class="'+(S.settings.goalMin===g?"on":"")+'">'+(g>=60 ? (g/60+" 小时") : g+" 分钟")+'</button>';
     }).join("");
@@ -3124,6 +3132,8 @@
       var writeState = function(){
         try{
           window.localStorage.setItem(KEY3, JSON.stringify(bk.state));
+          /* v2.9：恢复后的状态算最新本地修改，下次同步时推送上去 */
+          setLocalModifiedISO(syncNowISO());
         }catch(e){ setBkBusy(false); toast("恢复失败，进度写入出错"); return; }
         /* 内存里的 S 还是旧状态，必须重载让新状态生效；
            beforeunload 只结算计时（上面已结算过），不会覆盖刚写入的状态 */
@@ -3159,6 +3169,475 @@
     this.value = ""; /* 清空，允许重复选同一个文件 */
     if(f) restoreBackupFile(f);
   });
+
+  /* ---------- 自动同步（v2.9；Supabase，不用 SDK、不用 CDN，直接 fetch） ----------
+     登录：邮箱验证链接（magic link），点邮件里的链接回到托管版完成登录。
+     同步内容：复用 v2.0 备份的序列化——完整 v3 state + 录音（base64 dataURL）。
+     冲突：last-write-wins——远端 updated_at 与本地修改时间（SYNC_MOD_KEY）比较，
+     新的一方赢；相等不动；远端无记录则推送本地；本地无修改时间视为 0。
+     未登录时不发任何 Supabase 请求；任何失败都只记"待同步"，不丢本地数据、
+     不弹阻塞提示。同步初始化不阻塞应用启动（后台进行）。
+     注意：publishable key 是公开的客户端 key，设计上就是嵌进前端代码的；
+     数据安全靠 RLS（"own row" 策略：只能读写自己的行）。不要在这里放
+     service_role key。 */
+  var SYNC_URL = "https://vekgfwoeclydjbbcwpfg.supabase.co";
+  var SYNC_KEY = "sb_publishable__ZhdRxXHd7pgzmLjDHLxWQ_YNBEKDF8";
+  var SYNC_REDIRECT = "https://oliviazqq.github.io/ying-yu-da-zi-lian-xi/";
+  var SYNC_SESS_KEY = "typing-trainer-sync-session";
+  var SYNC_MOD_KEY = "typing-trainer-offline-v3-modified";
+  var SYNC_LAST_KEY = "typing-trainer-sync-last";
+  var SYNC_PENDING_EMAIL_KEY = "typing-trainer-sync-pending-email";
+  var syncSess = null;      /* {access_token, refresh_token, expires_at(ms), email, user_id} */
+  var syncStatus = "loggedout"; /* loggedout|syncing|synced|pending|offline|failed */
+  var syncBusy = false;
+  var syncPending = false;  /* 有待同步的本地修改或失败操作 */
+  var syncRecsDirty = false;/* 录音有未推送的修改 */
+  var syncLastRecs = null;  /* 上次成功推送/拉取的录音快照（卸载回补推送用） */
+  var syncPushTimer = null;
+  var syncFailToasted = false; /* 本轮失败是否已 toast 过（成功后清零） */
+  var SYNC_STATUS_TEXT = {
+    loggedout: "未登录", syncing: "同步中…", synced: "已同步",
+    pending: "等待同步", offline: "离线待同步", failed: "同步失败"
+  };
+  function syncNowISO(){ return new Date().toISOString(); }
+  function markLocalModified(){
+    try{ window.localStorage.setItem(SYNC_MOD_KEY, syncNowISO()); }catch(e){}
+  }
+  function localModifiedMs(){
+    try{
+      var v = window.localStorage.getItem(SYNC_MOD_KEY);
+      var ms = v ? Date.parse(v) : NaN;
+      return isNaN(ms) ? 0 : ms;
+    }catch(e){ return 0; }
+  }
+  function setLocalModifiedISO(iso){
+    try{ window.localStorage.setItem(SYNC_MOD_KEY, iso); }catch(e){}
+  }
+  function getLastSyncISO(){
+    try{ return window.localStorage.getItem(SYNC_LAST_KEY) || ""; }catch(e){ return ""; }
+  }
+  function setLastSyncNow(){
+    try{ window.localStorage.setItem(SYNC_LAST_KEY, syncNowISO()); }catch(e){}
+  }
+  function saveSyncSession(){
+    try{
+      if(syncSess) window.localStorage.setItem(SYNC_SESS_KEY, JSON.stringify(syncSess));
+      else window.localStorage.removeItem(SYNC_SESS_KEY);
+    }catch(e){}
+  }
+  function loadSyncSession(){
+    try{
+      var raw = window.localStorage.getItem(SYNC_SESS_KEY);
+      var s = raw ? JSON.parse(raw) : null;
+      if(s && s.access_token && s.refresh_token && s.user_id){ syncSess = s; return true; }
+    }catch(e){}
+    syncSess = null;
+    return false;
+  }
+  function parseJwtPayload(token){
+    try{
+      var parts = String(token).split(".");
+      if(parts.length!==3) return null;
+      var b64 = parts[1].replace(/-/g,"+").replace(/_/g,"/");
+      while(b64.length%4) b64 += "=";
+      return JSON.parse(atob(b64));
+    }catch(e){ return null; }
+  }
+  /* 带 10 秒超时的 fetch；resolve {status, data}，网络错/超时 reject Error("network"/"timeout")。
+     注意：用 window.fetch（调用时取值），不要缓存引用，测试用 mock 替换它。 */
+  function syncFetch(path, opts){
+    opts = opts || {};
+    var headers = { "apikey": SYNC_KEY };
+    if(opts.auth) headers["Authorization"] = "Bearer " + opts.auth;
+    if(opts.body !== undefined) headers["Content-Type"] = "application/json";
+    if(opts.prefer) headers["Prefer"] = opts.prefer;
+    var fetchP = window.fetch(SYNC_URL + path, {
+      method: opts.method || "GET",
+      headers: headers,
+      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+      keepalive: !!opts.keepalive
+    }).then(function(res){
+      return res.text().then(function(t){
+        var data = null;
+        try{ data = t ? JSON.parse(t) : null; }catch(e){ data = null; }
+        return { status: res.status, data: data };
+      });
+    }).catch(function(){ throw new Error("network"); });
+    var timer = null;
+    var timeoutP = new Promise(function(resolve, reject){
+      timer = setTimeout(function(){ reject(new Error("timeout")); }, 10000);
+    });
+    return Promise.race([fetchP, timeoutP]).then(function(r){
+      if(timer) clearTimeout(timer);
+      return r;
+    }, function(e){
+      if(timer) clearTimeout(timer);
+      throw e;
+    });
+  }
+  /* token 快过期（60 秒内）时先刷新；刷新失败 reject Error("refresh-failed") */
+  function ensureFreshToken(){
+    if(!syncSess) return Promise.reject(new Error("no-session"));
+    if(Date.now() < (syncSess.expires_at || 0) - 60000) return Promise.resolve(syncSess.access_token);
+    return refreshSession().then(function(){ return syncSess.access_token; });
+  }
+  function refreshSession(){
+    if(!syncSess || !syncSess.refresh_token) return Promise.reject(new Error("refresh-failed"));
+    var old = syncSess;
+    return syncFetch("/auth/v1/token?grant_type=refresh_token", {
+      method: "POST", body: { refresh_token: old.refresh_token }
+    }).then(function(r){
+      if(r.status !== 200 || !r.data || !r.data.access_token) throw new Error("refresh-failed");
+      var d = r.data;
+      var payload = parseJwtPayload(d.access_token) || {};
+      syncSess = {
+        access_token: d.access_token,
+        refresh_token: d.refresh_token || old.refresh_token,
+        expires_at: Date.now() + (d.expires_in || 3600) * 1000,
+        email: (d.user && d.user.email) || payload.email || old.email || "",
+        user_id: (d.user && d.user.id) || payload.sub || old.user_id
+      };
+      saveSyncSession();
+      return syncSess;
+    });
+    /* 注意：网络/超时错误原样透传（不要转成 refresh-failed），否则一次断网就会误登出 */
+  }
+  /* 带鉴权的 REST 调用；401 时刷新一次并重试一次；重试仍 401 则原样返回 401
+     （token 本身没问题时不要登出——例如表权限未配好的 42501 也会是 401）。 */
+  function syncRest(path, opts){
+    opts = opts || {};
+    var attempt = function(token){
+      return syncFetch(path, { method: opts.method || "GET", auth: token,
+        body: opts.body, prefer: opts.prefer });
+    };
+    return ensureFreshToken().then(function(token){
+      return attempt(token).then(function(r){
+        if(r.status !== 401) return r;
+        return refreshSession().then(function(){
+          return attempt(syncSess.access_token);
+        });
+      });
+    });
+  }
+  function sendMagicLink(email){
+    return syncFetch("/auth/v1/magiclink", {
+      method: "POST",
+      body: { email: email, options: { email_redirect_to: SYNC_REDIRECT } }
+    });
+  }
+  /* ---------- 同步状态 UI ---------- */
+  function setSyncStatus(st){
+    var prev = syncStatus;
+    syncStatus = st;
+    if(st === "synced" || st === "syncing") syncFailToasted = false;
+    if((st === "failed" || st === "offline") && prev !== "failed" && prev !== "offline" && !syncFailToasted){
+      syncFailToasted = true;
+      toast(st === "offline" ? "网络不可用，进度将在联网后同步" : "同步失败，稍后会再试");
+    }
+    renderSyncCard();
+  }
+  function renderSyncCard(){
+    var outBox = $("sync-logged-out"), inBox = $("sync-logged-in");
+    if(!outBox || !inBox) return;
+    var loggedIn = !!syncSess;
+    outBox.hidden = loggedIn;
+    inBox.hidden = !loggedIn;
+    if(!loggedIn) return;
+    var em = $("sync-email-show");
+    if(em) em.textContent = "账号：" + (syncSess.email || "已登录");
+    var st = $("sync-status");
+    if(st) st.textContent = "同步状态：" + (SYNC_STATUS_TEXT[syncStatus] || syncStatus);
+    var last = $("sync-last");
+    if(last){
+      var iso = getLastSyncISO();
+      var t = iso ? fmtRecTime(Date.parse(iso)) : "";
+      last.textContent = "上次同步：" + (t || "—");
+    }
+  }
+  /* ---------- 登录 / 退出 ---------- */
+  /* 解析验证链接回跳的 hash token；成功返回 true（已存 session 并清掉 hash） */
+  function syncLoginFromHash(){
+    var hash = window.location.hash || "";
+    if(hash.indexOf("access_token=") < 0) return false;
+    var params = {};
+    hash.replace(/^#/, "").split("&").forEach(function(p){
+      var kv = p.split("=");
+      if(kv[0]){ try{ params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || ""); }catch(e){} }
+    });
+    if(!params.access_token || !params.refresh_token) return false;
+    var payload = parseJwtPayload(params.access_token) || {};
+    var pendingEmail = "";
+    try{ pendingEmail = window.localStorage.getItem(SYNC_PENDING_EMAIL_KEY) || ""; }catch(e){}
+    syncSess = {
+      access_token: params.access_token,
+      refresh_token: params.refresh_token,
+      expires_at: Date.now() + (parseInt(params.expires_in, 10) || 3600) * 1000,
+      email: payload.email || pendingEmail,
+      user_id: payload.sub || ""
+    };
+    if(!syncSess.user_id){ syncSess = null; return false; }
+    saveSyncSession();
+    try{ window.localStorage.removeItem(SYNC_PENDING_EMAIL_KEY); }catch(e){}
+    try{
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    }catch(e){}
+    return true;
+  }
+  function syncLogout(silent){
+    syncSess = null;
+    saveSyncSession();
+    syncPending = false;
+    syncRecsDirty = false;
+    syncLastRecs = null;
+    if(syncPushTimer){ clearTimeout(syncPushTimer); syncPushTimer = null; }
+    try{ window.localStorage.removeItem(SYNC_LAST_KEY); }catch(e){}
+    try{ window.localStorage.removeItem(SYNC_PENDING_EMAIL_KEY); }catch(e){}
+    /* 本地修改时间（SYNC_MOD_KEY）保留：它描述的是本地状态的新旧，再登录时还要用 */
+    setSyncStatus("loggedout");
+    if(!silent) toast("已退出登录，本地进度已保留");
+  }
+  /* ---------- 拉取 / 推送 ---------- */
+  function doSyncPush(){
+    if(!syncSess) return Promise.reject(new Error("no-session"));
+    var pushedAt = syncNowISO();
+    return new Promise(function(resolve, reject){
+      collectRecordings(function(recs){
+        syncRest("/rest/v1/sync_state", {
+          method: "POST", prefer: "resolution=merge-duplicates",
+          body: { user_id: syncSess.user_id, state: S, recordings: recs, updated_at: pushedAt }
+        }).then(function(r){
+          if(r.status >= 200 && r.status < 300){
+            /* 推送期间若本地又有新修改（modified 比 pushedAt 新），不动它——
+               那次修改自带防抖推送；否则把本地时间对齐到这次推送 */
+            if(localModifiedMs() <= Date.parse(pushedAt)) setLocalModifiedISO(pushedAt);
+            setLastSyncNow();
+            syncRecsDirty = false;
+            syncLastRecs = recs;
+            resolve(true);
+          }else{
+            var e = new Error("push-failed:" + r.status); e.status = r.status; reject(e);
+          }
+        }, reject);
+      });
+    });
+  }
+  /* 拉取并比较；resolve {action:"pull"|"push"|"none", row?}。
+     比较用拉取开始时的本地时间快照（modAtStart），避免拉取耗时内本地修改干扰判断。 */
+  function doSyncPull(){
+    if(!syncSess) return Promise.reject(new Error("no-session"));
+    var modAtStart = localModifiedMs();
+    return syncRest("/rest/v1/sync_state?select=state,recordings,updated_at&user_id=eq." + encodeURIComponent(syncSess.user_id), {})
+      .then(function(r){
+        if(r.status < 200 || r.status >= 300){
+          var e = new Error("pull-failed:" + r.status); e.status = r.status; throw e;
+        }
+        var rows = Array.isArray(r.data) ? r.data : [];
+        if(!rows.length) return { action: "push", modAtStart: modAtStart };
+        var row = rows[0];
+        var remoteMs = row.updated_at ? Date.parse(row.updated_at) : NaN;
+        if(isNaN(remoteMs)) remoteMs = 0;
+        if(remoteMs > modAtStart){
+          /* 拉取过程中本地有新修改 → 不替换，改为推送（本地赢） */
+          if(localModifiedMs() > modAtStart) return { action: "push", modAtStart: modAtStart };
+          return { action: "pull", row: row, modAtStart: modAtStart };
+        }
+        if(modAtStart > remoteMs) return { action: "push", modAtStart: modAtStart };
+        return { action: "none", modAtStart: modAtStart };
+      });
+  }
+  /* 远端状态替换本地：先快照当前 state（复用 v2.0 pre-restore），再写录音，最后写 state。
+     录音解码/写入失败则什么都不改；拉取期间本地有新修改则放弃替换（cb "changed"）。
+     成功后刷新当前可见的界面（详情/学习/收藏/我的/场景库；练习视图读 S 是实时的，不用重渲染）。 */
+  function applyRemoteState(row, modAtStart, cb){
+    var st = row.state;
+    if(!st || typeof st !== "object" || st.v !== 3){ cb("bad"); return; }
+    var recs = Array.isArray(row.recordings) ? row.recordings : [];
+    var byKey = {};
+    var keyOrder = [];
+    var bad = false;
+    for(var i=0;i<recs.length;i++){
+      var r = recs[i];
+      if(!r || typeof r.key !== "string" || typeof r.data !== "string"){ bad = true; break; }
+      var blob = dataURLToBlob(r.data);
+      if(!blob || !blob.size){ bad = true; break; }
+      if(!byKey[r.key]){ byKey[r.key] = []; keyOrder.push(r.key); }
+      byKey[r.key].push({ blob: blob, durationSec: r.durationSec || 0, createdAt: r.createdAt || 0 });
+    }
+    if(bad){ cb("bad"); return; }
+    if(localModifiedMs() > modAtStart){ cb("changed"); return; }
+    try{ window.localStorage.setItem(BK_PRE_KEY, JSON.stringify(S)); }catch(e){}
+    var list = keyOrder.map(function(k){ return { key: k, val: { list: byKey[k] } }; });
+    var finish = function(){
+      if(localModifiedMs() > modAtStart){ cb("changed"); return; }
+      S = normalizeState(st);
+      try{ window.localStorage.setItem(KEY3, JSON.stringify(S)); }catch(e){}
+      setLocalModifiedISO(row.updated_at);
+      setLastSyncNow();
+      syncRecsDirty = false;
+      syncLastRecs = recs;
+      refreshLibrary();
+      updateLearnBadge();
+      renderSettings();
+      if($("view-detail") && $("view-detail").classList.contains("on") && typeof curScene !== "undefined" && curScene) renderDetail();
+      if($("view-learn") && $("view-learn").classList.contains("on")) renderLearn();
+      if($("view-fav") && $("view-fav").classList.contains("on")) renderFav();
+      cb("ok");
+    };
+    if(!recs.length){
+      IDB.replaceAll([], function(){ finish(); });
+      return;
+    }
+    IDB.replaceAll(list, function(ok){
+      if(!ok){ cb("bad"); return; }
+      finish();
+    });
+  }
+  /* 一次同步：先拉取比较——远端新则替换本地，本地新则推送，相等不动。
+     刷新 token 失败视为登录过期（登出）；其余失败记待同步，等在线/定时重试。 */
+  function syncNow(){
+    if(!syncSess) return Promise.resolve(false);
+    if(syncBusy){ syncPending = true; return Promise.resolve(false); }
+    syncBusy = true;
+    /* 本轮处理的就是待同步项，开始时先清标志；本轮中新来的请求会再把它置起，
+       成功后据此决定是否重跑（不清的话每轮都会误判为"忙时积压"而多跑一轮） */
+    syncPending = false;
+    setSyncStatus("syncing");
+    return doSyncPull().then(function(decision){
+      if(decision.action === "pull"){
+        return new Promise(function(resolve){
+          applyRemoteState(decision.row, decision.modAtStart, function(out){
+            if(out === "ok") resolve("pulled");
+            else if(out === "changed") resolve("push");
+            else resolve("failed");
+          });
+        }).then(function(out){
+          if(out === "push") return doSyncPush().then(function(){ return "pushed"; });
+          return out;
+        });
+      }
+      if(decision.action === "push") return doSyncPush().then(function(){ return "pushed"; });
+      return "noop";
+    }).then(function(outcome){
+      syncBusy = false;
+      var queued = syncPending;
+      if(outcome === "failed"){
+        setSyncStatus("failed");
+        syncPending = true;
+      }else{
+        setSyncStatus("synced");
+      }
+      if(queued && outcome !== "failed") syncNow();
+      return true;
+    }, function(err){
+      syncBusy = false;
+      if(err && err.message === "refresh-failed"){
+        syncLogout(true);
+        toast("登录已过期，请重新登录");
+        return false;
+      }
+      var offline = (typeof navigator !== "undefined" && navigator.onLine === false)
+        || (err && (err.message === "network" || err.message === "timeout"));
+      setSyncStatus(offline ? "offline" : "failed");
+      syncPending = true;
+      return false;
+    });
+  }
+  /* 本地变化后防抖 2 秒推送（实际走 syncNow：先拉取比较，避免盖掉远端更新） */
+  function scheduleSyncPush(){
+    if(!syncSess) return;
+    syncPending = true;
+    if(syncPushTimer) clearTimeout(syncPushTimer);
+    syncPushTimer = setTimeout(function(){
+      syncPushTimer = null;
+      if(!syncSess) return;
+      if(syncStatus !== "syncing") setSyncStatus("pending");
+      syncNow();
+    }, 2000);
+  }
+  /* 录音保存/删除后：录音也是同步内容，记修改并安排推送 */
+  function syncOnRecordingChanged(){
+    if(!syncSess) return;
+    syncRecsDirty = true;
+    markLocalModified();
+    scheduleSyncPush();
+  }
+  /* 切后台/关闭时的回补推送：只在录音干净且有上次快照时发（fire-and-forget，
+     不阻塞 unload）。录音有未推送的修改时不发——陈旧的录音快照可能盖掉远端
+     更新，留给下次打开时正常同步。 */
+  function syncFlushOnHide(){
+    if(!syncSess || !syncPending || syncRecsDirty || !syncLastRecs) return;
+    if(!window.fetch) return;
+    try{
+      window.fetch(SYNC_URL + "/rest/v1/sync_state", {
+        method: "POST", keepalive: true,
+        headers: { "apikey": SYNC_KEY, "Authorization": "Bearer " + syncSess.access_token,
+          "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates" },
+        body: JSON.stringify({ user_id: syncSess.user_id, state: S,
+          recordings: syncLastRecs, updated_at: syncNowISO() })
+      }).catch(function(){});
+    }catch(e){}
+  }
+  /* ---------- 同步初始化（后台进行，不阻塞启动） ---------- */
+  function syncInit(){
+    var fromHash = syncLoginFromHash();
+    if(!fromHash) loadSyncSession();
+    renderSyncCard();
+    if(syncSess){
+      if(fromHash) toast("登录成功，正在同步…");
+      setSyncStatus("pending");
+      syncNow();
+    }
+    document.addEventListener("visibilitychange", function(){
+      if(!document.hidden){
+        if(syncSess && syncPending) syncNow();
+      }else{
+        syncFlushOnHide();
+      }
+    });
+    window.addEventListener("online", function(){
+      if(syncSess && syncPending) syncNow();
+    });
+    window.addEventListener("beforeunload", function(){ syncFlushOnHide(); });
+    setInterval(function(){
+      if(syncSess && syncPending && !syncBusy) syncNow();
+    }, 60000);
+  }
+  /* ---------- 同步卡片按钮 ---------- */
+  $("sync-send-link").addEventListener("click", function(){
+    var input = $("sync-email");
+    var email = input ? input.value.replace(/^\s+|\s+$/g, "") : "";
+    var at = email.indexOf("@");
+    if(!email || at < 1 || email.indexOf(".", at) < 0){
+      toast("请输入正确的邮箱地址");
+      return;
+    }
+    var btn = $("sync-send-link");
+    btn.disabled = true;
+    var oldText = btn.textContent;
+    btn.textContent = "发送中…";
+    sendMagicLink(email).then(function(r){
+      btn.disabled = false;
+      btn.textContent = oldText;
+      if(r.status === 200){
+        try{ window.localStorage.setItem(SYNC_PENDING_EMAIL_KEY, email); }catch(e){}
+        toast("验证链接已发送到邮箱，请点链接登录");
+      }else if(r.status === 429){
+        toast("发送太频繁，请稍后再试");
+      }else if(r.status === 400){
+        toast("邮箱地址无效，请检查后重试");
+      }else{
+        toast("发送失败，请检查网络后重试");
+      }
+    }, function(){
+      btn.disabled = false;
+      btn.textContent = oldText;
+      toast("发送失败，请检查网络后重试");
+    });
+  });
+  $("sync-now").addEventListener("click", function(){
+    if(syncSess) syncNow();
+  });
+  $("sync-logout").addEventListener("click", function(){ syncLogout(false); });
 
   /* ---------- tabs ---------- */
   $("tab-library").addEventListener("click", function(){
@@ -3196,9 +3675,11 @@
   applyVideoState();
 
   loadState();
+  syncBooting = false; /* 启动加载完成，此后 saveState 正常记本地修改时间 */
   refreshLibrary();
   buildCollChips();
   buildCollRows();
   renderCollection();
   updateLearnBadge();
+  syncInit(); /* v2.9：后台恢复登录态并首次同步，不阻塞启动 */
 })();

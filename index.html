@@ -431,6 +431,26 @@
           </div>
           <input type="file" id="bk-file" accept=".json,application/json" hidden />
         </div>
+        <div class="card settings-card sync-card">
+          <div class="set-title">自动同步</div>
+          <div class="sync-note">登录后，手机和电脑的学习进度自动同步，不用再手动备份恢复。</div>
+          <div id="sync-logged-out">
+            <input type="email" id="sync-email" class="sync-email" placeholder="输入邮箱地址" autocomplete="email" />
+            <div class="p-actions bk-actions">
+              <button class="primary" id="sync-send-link">发送登录链接</button>
+            </div>
+            <div class="sync-note sync-hint">验证链接会发到你的邮箱，点链接即可登录。</div>
+          </div>
+          <div id="sync-logged-in" hidden>
+            <div class="sync-meta" id="sync-email-show">账号：—</div>
+            <div class="sync-meta" id="sync-status">同步状态：—</div>
+            <div class="sync-meta" id="sync-last">上次同步：—</div>
+            <div class="p-actions bk-actions">
+              <button class="primary" id="sync-now">立即同步</button>
+              <button id="sync-logout">退出登录</button>
+            </div>
+          </div>
+        </div>
         <div class="set-more">更多设置（主题、语音引擎等）后续再加</div>
         <div class="ver-note">离线版 · 学习路径版 · 进度保存在本机浏览器 · 与在线账号不互通</div>
       </section>
